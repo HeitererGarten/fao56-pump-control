@@ -1,0 +1,367 @@
+#include "config.h"
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <time.h>
+
+
+// System states
+enum PumpState {
+    IDLE,
+    IRRIGATING,
+    EMERGENCY_HALT,
+    FAULT
+};
+
+// Global variables
+PumpState currentState = IDLE;
+unsigned long irrigationStartTime = 0;
+unsigned long irrigationDuration = 0; // in milliseconds
+unsigned long remainingTime = 0;
+bool pumpActive = false;
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+JsonDocument doc;
+
+// Function declarations
+void setupWiFi();
+void setupMQTT();
+void callback(char* topic, byte* payload, unsigned int length);
+void reconnectMQTT();
+void handleStateTransitions();
+void controlPump(bool state);
+void publishStatus();
+bool isIrrigationTime();
+void setupTime();
+
+void setup() {
+    Serial.begin(115200);
+    
+    // Initialize pins
+    pinMode(RELAY_PIN, OUTPUT);
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(RELAY_PIN, LOW);
+    digitalWrite(LED_PIN, LOW);
+    
+    // Setup connections
+    setupWiFi();
+    setupTime();
+    setupMQTT();
+    
+    // Connect to MQTT broker before publishing
+    while (!client.connected()) {
+        reconnectMQTT();
+    }
+    
+    Serial.println("Pump Control System Initialized");
+    publishStatus();
+}
+
+void loop() {
+    // Check WiFi connection
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi disconnected, reconnecting...");
+        setupWiFi();
+    }
+    
+    if (!client.connected()) {
+        reconnectMQTT();
+    }
+    client.loop();
+    
+    handleStateTransitions();
+    delay(1000);
+}
+
+void setupWiFi() {
+    delay(10);
+    Serial.println();
+    Serial.print("Connecting to ");
+    Serial.println(WIFI_SSID);
+    
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.print(".");
+    }
+    
+    Serial.println("");
+    Serial.println("WiFi connected");
+    Serial.println("IP address: ");
+    Serial.println(WiFi.localIP());
+}
+
+void setupTime() {
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    Serial.println("Waiting for time synchronization...");
+    
+    struct tm timeinfo;
+    while (!getLocalTime(&timeinfo)) {
+      delay(1000);
+      Serial.print(".");
+    }
+    Serial.println("Time synchronized");
+}
+
+void setupMQTT() {
+    client.setServer(MQTT_SERVER, MQTT_PORT);
+    client.setCallback(callback);
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+    String message;
+    for (int i = 0; i < length; i++) {
+        message += (char)payload[i];
+    }
+    
+    Serial.print("Message received: ");
+    Serial.println(message);
+    
+    // Parse JSON
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, message);
+    
+    if (error) {
+        Serial.print("JSON parsing failed: ");
+        Serial.println(error.c_str());
+        return;
+    }
+    
+    String signal = doc["signal"];
+    float irr_time = doc["irr_time"];
+    String targetId = doc["id"];
+    
+    // Debug prints
+    Serial.print("Parsed signal: '");
+    Serial.print(signal);
+    Serial.println("'");
+    Serial.print("Parsed irr_time: ");
+    Serial.println(irr_time, 2);
+    Serial.print("Parsed targetId: '");
+    Serial.print(targetId);
+    Serial.println("'");
+    Serial.print("Expected DEVICE_ID: '");
+    Serial.print(DEVICE_ID);
+    Serial.println("'");
+    Serial.print("Current state: ");
+    Serial.println(currentState);
+    Serial.print("Is irrigation time: ");
+    Serial.println(isIrrigationTime());
+    
+    // Check if message is for this device
+    if (targetId != DEVICE_ID) {
+        Serial.println("Message not for this device, ignoring...");
+        return;
+    }
+    
+    Serial.println("Message is for this device!");
+        // VALIDATE IRRIGATION TIME
+    if (signal == "On" && irr_time <= minIrrMinutes) {
+        Serial.print("Invalid irrigation time: ");
+        Serial.println(irr_time);
+        Serial.println("Irrigation time must be greater than 0");
+        return;
+    }
+    
+    // CHECK FOR REASONABLE MAXIMUM (e.g., 120 minutes = 2 hours)
+    if (signal == "On" && irr_time > maxIrrMinutes) {
+        Serial.print("Irrigation time too long: ");
+        Serial.println(irr_time);
+        Serial.print("Maximum allowed: ");
+        Serial.println(maxIrrMinutes);
+        return;
+    }
+    
+    // Handle commands based on current state and signal
+    if (signal == "On" && currentState == IDLE && isIrrigationTime()) {
+        Serial.println("Condition met: Starting irrigation");
+        irrigationDuration = (unsigned long) (irr_time * 60 * 1000); // Convert minutes to milliseconds
+        remainingTime = irrigationDuration;
+        irrigationStartTime = millis();
+        currentState = IRRIGATING;
+        controlPump(true);
+        publishStatus();
+    }
+    else if (signal == "On" && currentState == EMERGENCY_HALT && isIrrigationTime()) {
+        Serial.println("Condition met: Resuming from emergency halt");
+        irrigationDuration = remainingTime;  // Set duration to remaining time
+        irrigationStartTime = millis();      // Reset start time to now
+        currentState = IRRIGATING;
+        controlPump(true);
+        publishStatus();
+        
+        Serial.print("Resuming with ");
+        Serial.print(remainingTime / (60.0 * 1000.0), 1);
+        Serial.println(" minutes remaining");
+    }
+    else if (signal == "Emergency Halt" && currentState == IRRIGATING) {
+        Serial.println("Condition met: Emergency halt");
+        unsigned long elapsed = millis() - irrigationStartTime;
+        remainingTime = irrigationDuration - elapsed;
+        currentState = EMERGENCY_HALT;
+        controlPump(false);
+        publishStatus();
+    }
+    else if (signal == "Stop") {
+        Serial.println("Condition met: Stopping");
+        currentState = IDLE;
+        irrigationDuration = 0;
+        remainingTime = 0;
+        controlPump(false);
+        publishStatus();
+    }
+    else {
+        Serial.println("No conditions met! Checking why:");
+        Serial.print("Signal == 'On'? ");
+        Serial.println(signal == "On");
+        Serial.print("State == IDLE? ");
+        Serial.println(currentState == IDLE);
+        Serial.print("Is irrigation time? ");
+        Serial.println(isIrrigationTime());
+    }
+}
+
+void reconnectMQTT() {
+    while (!client.connected()) {
+        Serial.print("Attempting MQTT connection...");
+        if (client.connect("PumpController")) {
+            Serial.println("connected");
+            client.subscribe(MQTT_TOPIC_SUB);
+        } 
+        else {
+            Serial.print("failed, rc=");
+            Serial.print(client.state());
+            Serial.println(" try again in 5 seconds");
+            delay(5000);
+        }
+    }
+}
+
+void handleStateTransitions() {
+    unsigned long currentTime = millis();
+    
+    switch (currentState) {
+        case IDLE:
+          // Nothing to do in idle state
+          break;
+          
+        case IRRIGATING:
+            if (!isIrrigationTime()) {
+              // Outside irrigation window - emergency halt
+              currentState = EMERGENCY_HALT;
+              controlPump(false);
+              publishStatus();
+          }
+          else {
+              // Update remaining time
+              unsigned long elapsed = currentTime - irrigationStartTime;
+              if (elapsed >= irrigationDuration) {
+                  // Irrigation complete
+                  currentState = IDLE;
+                  irrigationDuration = 0;
+                  remainingTime = 0;
+                  controlPump(false);
+                  publishStatus();
+                  Serial.println("Irrigation completed!");
+              } else {
+                  remainingTime = irrigationDuration - elapsed;
+                  
+                  // Print remaining time to serial
+                  unsigned long remainingMinutes = remainingTime / (60 * 1000);
+                  unsigned long remainingSeconds = (remainingTime % (60 * 1000)) / 1000;
+                  
+                  Serial.print("Remaining irrigation time: ");
+                  Serial.print(remainingMinutes);
+                  Serial.print(" minutes, ");
+                  Serial.print(remainingSeconds);
+                  Serial.println(" seconds");
+              }
+          }
+          break;
+          
+        case EMERGENCY_HALT:
+          // Print remaining time during emergency halt too
+          if (remainingTime > 0) {
+              unsigned long remainingMinutes = remainingTime / (60 * 1000);
+              unsigned long remainingSeconds = (remainingTime % (60 * 1000)) / 1000;
+              
+              Serial.print("EMERGENCY HALT - Remaining time: ");
+              Serial.print(remainingMinutes);
+              Serial.print(" minutes, ");
+              Serial.print(remainingSeconds);
+              Serial.println(" seconds");
+          }
+          break;
+          
+        case FAULT:
+            // Handle fault conditions
+            controlPump(false);
+            Serial.println("FAULT STATE - Pump stopped");
+            break;
+    }
+}
+
+void controlPump(bool state) {
+    pumpActive = state;
+    digitalWrite(RELAY_PIN, state ? HIGH : LOW);
+    digitalWrite(LED_PIN, state ? HIGH : LOW);
+    
+    Serial.print("Pump ");
+    Serial.println(state ? "ON" : "OFF");
+    
+    // Print irrigation info when pump turns on
+    if (state && remainingTime > 0) {
+        float totalMinutes = irrigationDuration / (60.0 * 1000.0);
+        Serial.print("Starting irrigation for ");
+        Serial.print(totalMinutes);
+        Serial.println(" minutes");
+    }
+}
+
+void publishStatus() {
+    doc.clear();
+    
+    // Convert state to string
+    String stateStr;
+    switch (currentState) {
+        case IDLE: stateStr = "IDLE"; break;
+        case IRRIGATING: stateStr = "IRRIGATING"; break;
+        case EMERGENCY_HALT: stateStr = "EMERGENCY_HALT"; break;
+        case FAULT: stateStr = "FAULT"; break;
+    }
+    // Prepare JSON document
+    doc["id"] = DEVICE_ID;
+    doc["state"] = stateStr;
+    doc["pump_active"] = pumpActive;
+    doc["remaining_time_minutes"] = remainingTime / (60 * 1000);
+    doc["irrigation_allowed"] = isIrrigationTime();
+    
+    // Add current time
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+        char timeStr[20];
+        strftime(timeStr, sizeof(timeStr), "%H:%M:%S", &timeinfo);
+        doc["current_time"] = timeStr;
+    }
+    
+    String output;
+    serializeJson(doc, output);
+    
+    client.publish(MQTT_TOPIC_PUB, output.c_str());
+    Serial.println("Status published: " + output);
+}
+
+bool isIrrigationTime() {
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) {
+        return false; // If time not available, don't allow irrigation
+    }
+    
+    int hour = timeinfo.tm_hour;
+    
+    // Morning: 7-9 AM (7:00-8:59)
+    // Evening: 5-7 PM (17:00-18:59)
+    return ((hour >= 7 && hour < 9) || (hour >= 12 && hour < 19));
+}
